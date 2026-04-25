@@ -388,45 +388,101 @@ def remote_mkdirs(sftp, remote_path: str) -> None:
     if not remote_path:
         return
 
-    current = ""
-    for part in PurePosixPath(remote_path).parts:
+    parts = PurePosixPath(remote_path).parts
+    current = "/" if parts and parts[0] == "/" else ""
+    for part in parts:
         if part == "/":
-            current = "/"
             continue
-        current = part if current in {"", "/"} else posixpath.join(current, part)
+        current = posixpath.join(current, part) if current else part
         try:
             sftp.stat(current)
-        except FileNotFoundError:
+        except (FileNotFoundError, IOError, OSError):
             try:
                 sftp.mkdir(current)
             except OSError:
+                # Another process may have created it, or the parent may already exist.
+                try:
+                    sftp.stat(current)
+                except Exception:
+                    raise
+
+
+def remote_file_is_current(sftp, local_file: Path, remote_path: str) -> bool:
+    if truthy(env("DEPLOY_FORCE_UPLOAD")):
+        return False
+    try:
+        st = sftp.stat(remote_path)
+    except (FileNotFoundError, IOError, OSError):
+        return False
+
+    local_stat = local_file.stat()
+    if int(st.st_size) != int(local_stat.st_size):
+        return False
+
+    # We set remote mtime after upload, so this is a cheap and reliable skip
+    # for files this deploy script has already synced.
+    remote_mtime = int(getattr(st, "st_mtime", 0) or 0)
+    local_mtime = int(local_stat.st_mtime)
+    return abs(remote_mtime - local_mtime) <= 1
+
+
+def upload_file(sftp, local_file: Path, remote_path: str, remote_rel: str) -> bool:
+    remote_mkdirs(sftp, posixpath.dirname(remote_path))
+    if remote_file_is_current(sftp, local_file, remote_path):
+        log(f"  Unchanged: {remote_rel}", YELLOW)
+        return False
+
+    tmp_path = f"{remote_path}.tmp-{os.getpid()}"
+    try:
+        sftp.put(str(local_file), tmp_path)
+        try:
+            sftp.rename(tmp_path, remote_path)
+        except OSError:
+            try:
+                sftp.remove(remote_path)
+            except OSError:
                 pass
+            sftp.rename(tmp_path, remote_path)
+        local_mtime = int(local_file.stat().st_mtime)
+        try:
+            sftp.utime(remote_path, (local_mtime, local_mtime))
+        except OSError:
+            pass
+    except Exception as exc:
+        try:
+            sftp.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(f"Upload failed for {remote_rel} -> {remote_path}: {exc}") from exc
+
+    size_kb = local_file.stat().st_size / 1024
+    log(f"  Uploaded: {remote_rel} ({size_kb:.1f} KB)", GREEN)
+    return True
 
 
-def upload_item(sftp, local_item: Path, remote_base: str) -> int:
+def upload_item(sftp, local_item: Path, remote_base: str) -> tuple[int, int]:
     uploaded = 0
+    skipped = 0
     if local_item.is_dir():
         for child in local_item.rglob("*"):
             if not child.is_file() or should_skip_path(child):
                 continue
             remote_rel = child.relative_to(ROOT).as_posix()
             remote_path = f"{remote_base}/{remote_rel}"
-            remote_mkdirs(sftp, posixpath.dirname(remote_path))
-            sftp.put(str(child), remote_path)
-            uploaded += 1
-            size_kb = child.stat().st_size / 1024
-            log(f"  Uploaded: {remote_rel} ({size_kb:.1f} KB)", GREEN)
+            if upload_file(sftp, child, remote_path, remote_rel):
+                uploaded += 1
+            else:
+                skipped += 1
     elif local_item.is_file():
         if should_skip_path(local_item):
-            return 0
+            return 0, 0
         remote_rel = local_item.relative_to(ROOT).as_posix()
         remote_path = f"{remote_base}/{remote_rel}"
-        remote_mkdirs(sftp, posixpath.dirname(remote_path))
-        sftp.put(str(local_item), remote_path)
-        uploaded += 1
-        size_kb = local_item.stat().st_size / 1024
-        log(f"  Uploaded: {remote_rel} ({size_kb:.1f} KB)", GREEN)
-    return uploaded
+        if upload_file(sftp, local_item, remote_path, remote_rel):
+            uploaded += 1
+        else:
+            skipped += 1
+    return uploaded, skipped
 
 
 def sync_service_file(client, sftp, remote_root: str) -> bool:
@@ -556,19 +612,28 @@ def deploy_to_ec2() -> bool:
         )
         log("SSH connection kamyab!", GREEN)
 
-        sftp = client.open_sftp()
-        uploaded = 0
-
         remote_root = deploy_path.rstrip("/")
+        sftp = client.open_sftp()
+        remote_mkdirs(sftp, remote_root)
+        uploaded = 0
+        skipped = 0
+
         for item in upload_items:
             local_item = ROOT / item
             if not local_item.exists():
                 log(f"  Skip (nahi mila): {item}", YELLOW)
                 continue
-            uploaded += upload_item(sftp, local_item, remote_root)
+            item_uploaded, item_skipped = upload_item(sftp, local_item, remote_root)
+            uploaded += item_uploaded
+            skipped += item_skipped
 
         sftp.close()
-        log(f"{uploaded} files uploaded.", CYAN)
+        log(f"{uploaded} files uploaded, {skipped} unchanged skipped.", CYAN)
+
+        if uploaded == 0 and not truthy(env("DEPLOY_RESTART_ALWAYS")):
+            log("Remote files already current hain. Service sync/deps/restart skip.", GREEN)
+            client.close()
+            return True
 
         sftp = client.open_sftp()
         sync_service_file(client, sftp, remote_root)
